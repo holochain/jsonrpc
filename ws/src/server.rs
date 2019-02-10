@@ -127,6 +127,12 @@ impl Server {
 			broadcaster: self.broadcaster.clone(),
 		}
 	}
+
+	/// Returns a cloned ws::Sender used to send to the client..
+	/// Be careful to call `shutdown()` on this when done with it.
+	pub fn broadcaster(&self) -> ws::Sender {
+		self.broadcaster.clone()
+	}
 }
 
 impl Drop for Server {
