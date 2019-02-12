@@ -41,6 +41,7 @@ impl<M, F, I> UnsubscribeRpcMethod<M> for F where
 }
 
 /// Publish-Subscribe extension of `IoHandler`.
+#[derive(Debug)]
 pub struct PubSubHandler<T: PubSubMetadata, S: core::Middleware<T> = core::middleware::Noop> {
 	handler: core::MetaIoHandler<T, S>,
 }
