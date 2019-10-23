@@ -18,42 +18,43 @@
 //! }
 //! ```
 
-#![warn(missing_docs)]
-
+#![deny(missing_docs)]
 
 use jsonrpc_server_utils as server_utils;
 use net2;
 
-pub use jsonrpc_core;
 pub use hyper;
+pub use jsonrpc_core;
 
 #[macro_use]
 extern crate log;
 
 mod handler;
 mod response;
-mod utils;
 #[cfg(test)]
 mod tests;
+mod utils;
 
 use std::io;
-use std::sync::{mpsc, Arc};
 use std::net::SocketAddr;
+use std::sync::{mpsc, Arc};
 use std::thread;
 
+use parking_lot::Mutex;
+
+use crate::jsonrpc::futures::sync::oneshot;
+use crate::jsonrpc::futures::{self, Future, Stream};
+use crate::jsonrpc::MetaIoHandler;
+use crate::server_utils::reactor::{Executor, UninitializedExecutor};
 use hyper::{server, Body};
 use jsonrpc_core as jsonrpc;
-use crate::jsonrpc::MetaIoHandler;
-use crate::jsonrpc::futures::{self, Future, Stream, future};
-use crate::jsonrpc::futures::sync::oneshot;
-use crate::server_utils::reactor::{Executor, UninitializedExecutor};
 
-pub use crate::server_utils::hosts::{Host, DomainsValidation};
-pub use crate::server_utils::cors::{self, AccessControlAllowOrigin, Origin, AllowCors};
-pub use crate::server_utils::{tokio, SuspendableStream};
 pub use crate::handler::ServerHandler;
-pub use crate::utils::{is_host_allowed, cors_allow_origin, cors_allow_headers};
 pub use crate::response::Response;
+pub use crate::server_utils::cors::{self, AccessControlAllowOrigin, AllowCors, Origin};
+pub use crate::server_utils::hosts::{DomainsValidation, Host};
+pub use crate::server_utils::{tokio, SuspendableStream};
+pub use crate::utils::{cors_allow_headers, cors_allow_origin, is_host_allowed};
 
 /// Action undertaken by a middleware.
 pub enum RequestMiddlewareAction {
@@ -70,8 +71,8 @@ pub enum RequestMiddlewareAction {
 		/// Should standard hosts validation be performed?
 		should_validate_hosts: bool,
 		/// a future for server response
-		response: Box<Future<Item=hyper::Response<Body>, Error=hyper::Error> + Send>,
-	}
+		response: Box<dyn Future<Item = hyper::Response<Body>, Error = hyper::Error> + Send>,
+	},
 }
 
 impl From<Response> for RequestMiddlewareAction {
@@ -107,7 +108,8 @@ pub trait RequestMiddleware: Send + Sync + 'static {
 	fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction;
 }
 
-impl<F> RequestMiddleware for F where
+impl<F> RequestMiddleware for F
+where
 	F: Fn(hyper::Request<Body>) -> RequestMiddlewareAction + Sync + Send + 'static,
 {
 	fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
@@ -132,7 +134,8 @@ pub trait MetaExtractor<M: jsonrpc::Metadata>: Sync + Send + 'static {
 	fn read_metadata(&self, _: &hyper::Request<Body>) -> M;
 }
 
-impl<M, F> MetaExtractor<M> for F where
+impl<M, F> MetaExtractor<M> for F
+where
 	M: jsonrpc::Metadata,
 	F: Fn(&hyper::Request<Body>) -> M + Sync + Send + 'static,
 {
@@ -154,7 +157,7 @@ pub struct Rpc<M: jsonrpc::Metadata = (), S: jsonrpc::Middleware<M> = jsonrpc::m
 	/// RPC Handler
 	pub handler: Arc<MetaIoHandler<M, S>>,
 	/// Metadata extractor
-	pub extractor: Arc<MetaExtractor<M>>,
+	pub extractor: Arc<dyn MetaExtractor<M>>,
 }
 
 impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> Clone for Rpc<M, S> {
@@ -191,8 +194,8 @@ pub enum RestApi {
 pub struct ServerBuilder<M: jsonrpc::Metadata = (), S: jsonrpc::Middleware<M> = jsonrpc::middleware::Noop> {
 	handler: Arc<MetaIoHandler<M, S>>,
 	executor: UninitializedExecutor,
-	meta_extractor: Arc<MetaExtractor<M>>,
-	request_middleware: Arc<RequestMiddleware>,
+	meta_extractor: Arc<dyn MetaExtractor<M>>,
+	request_middleware: Arc<dyn RequestMiddleware>,
 	cors_domains: CorsDomains,
 	cors_max_age: Option<u32>,
 	allowed_headers: cors::AccessControlAllowHeaders,
@@ -210,8 +213,9 @@ impl<M: jsonrpc::Metadata + Default, S: jsonrpc::Middleware<M>> ServerBuilder<M,
 	/// By default:
 	/// 1. Server is not sending any CORS headers.
 	/// 2. Server is validating `Host` header.
-	pub fn new<T>(handler: T) -> Self where
-		T: Into<MetaIoHandler<M, S>>
+	pub fn new<T>(handler: T) -> Self
+	where
+		T: Into<MetaIoHandler<M, S>>,
 	{
 		Self::with_meta_extractor(handler, NoopExtractor)
 	}
@@ -223,7 +227,8 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 	/// By default:
 	/// 1. Server is not sending any CORS headers.
 	/// 2. Server is validating `Host` header.
-	pub fn with_meta_extractor<T, E>(handler: T, extractor: E) -> Self where
+	pub fn with_meta_extractor<T, E>(handler: T, extractor: E) -> Self
+	where
 		T: Into<MetaIoHandler<M, S>>,
 		E: MetaExtractor<M>,
 	{
@@ -268,7 +273,8 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 	/// Error returned from the method will be converted to status `500` response.
 	///
 	/// Expects a tuple with `(<path>, <rpc-method-name>)`.
-	pub fn health_api<A, B, T>(mut self, health_api: T) -> Self where
+	pub fn health_api<A, B, T>(mut self, health_api: T) -> Self
+	where
 		T: Into<Option<(A, B)>>,
 		A: Into<String>,
 		B: Into<String>,
@@ -281,7 +287,7 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 	///
 	/// Default is true.
 	pub fn keep_alive(mut self, val: bool) -> Self {
-		self.keep_alive  = val;
+		self.keep_alive = val;
 		self
 	}
 
@@ -289,6 +295,7 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 	///
 	/// Panics when set to `0`.
 	#[cfg(not(unix))]
+	#[allow(unused_mut)]
 	pub fn threads(mut self, _threads: usize) -> Self {
 		warn!("Multi-threaded server is not available on Windows. Falling back to single thread.");
 		self
@@ -297,6 +304,12 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 	/// Sets number of threads of the server to run.
 	///
 	/// Panics when set to `0`.
+	/// The first thread will use provided `Executor` instance
+	/// and all other threads will use `UninitializedExecutor` to spawn
+	/// a new runtime for futures.
+	/// So it's also possible to run a multi-threaded server by
+	/// passing the default `tokio::runtime` executor to this builder
+	/// and setting `threads` to 1.
 	#[cfg(unix)]
 	pub fn threads(mut self, threads: usize) -> Self {
 		self.threads = threads;
@@ -321,7 +334,7 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 
 	/// Configure the CORS `AccessControlAllowHeaders` header which are allowed.
 	pub fn cors_allow_headers(mut self, allowed_headers: cors::AccessControlAllowHeaders) -> Self {
-		self.allowed_headers = allowed_headers.into();
+		self.allowed_headers = allowed_headers;
 		self
 	}
 
@@ -373,10 +386,12 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 
 		let (local_addr_tx, local_addr_rx) = mpsc::channel();
 		let (close, shutdown_signal) = oneshot::channel();
+		let (done_tx, done_rx) = oneshot::channel();
 		let eloop = self.executor.init_with_name("http.worker0")?;
 		let req_max_size = self.max_request_body_size;
+		// The first threads `Executor` is initialised differently from the others
 		serve(
-			(shutdown_signal, local_addr_tx),
+			(shutdown_signal, local_addr_tx, done_tx),
 			eloop.executor(),
 			addr.to_owned(),
 			cors_domains.clone(),
@@ -391,61 +406,78 @@ impl<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>> ServerBuilder<M, S> {
 			reuse_port,
 			req_max_size,
 		);
-		let handles = (0..self.threads - 1).map(|i| {
-			let (local_addr_tx, local_addr_rx) = mpsc::channel();
-			let (close, shutdown_signal) = oneshot::channel();
-			let eloop = UninitializedExecutor::Unspawned.init_with_name(format!("http.worker{}", i + 1))?;
-			serve(
-				(shutdown_signal, local_addr_tx),
-				eloop.executor(),
-				addr.to_owned(),
-				cors_domains.clone(),
-				cors_max_age,
-				allowed_headers.clone(),
-				request_middleware.clone(),
-				allowed_hosts.clone(),
-				jsonrpc_handler.clone(),
-				rest_api,
-				health_api.clone(),
-				keep_alive,
-				reuse_port,
-				req_max_size,
-			);
-			Ok((eloop, close, local_addr_rx))
-		}).collect::<io::Result<Vec<_>>>()?;
+		let handles = (0..self.threads - 1)
+			.map(|i| {
+				let (local_addr_tx, local_addr_rx) = mpsc::channel();
+				let (close, shutdown_signal) = oneshot::channel();
+				let (done_tx, done_rx) = oneshot::channel();
+				let eloop = UninitializedExecutor::Unspawned.init_with_name(format!("http.worker{}", i + 1))?;
+				serve(
+					(shutdown_signal, local_addr_tx, done_tx),
+					eloop.executor(),
+					addr.to_owned(),
+					cors_domains.clone(),
+					cors_max_age,
+					allowed_headers.clone(),
+					request_middleware.clone(),
+					allowed_hosts.clone(),
+					jsonrpc_handler.clone(),
+					rest_api,
+					health_api.clone(),
+					keep_alive,
+					reuse_port,
+					req_max_size,
+				);
+				Ok((eloop, close, local_addr_rx, done_rx))
+			})
+			.collect::<io::Result<Vec<_>>>()?;
 
 		// Wait for server initialization
 		let local_addr = recv_address(local_addr_rx);
 		// Wait for other threads as well.
-		let mut handles = handles.into_iter().map(|(eloop, close, local_addr_rx)| {
-			let _ = recv_address(local_addr_rx)?;
-			Ok((eloop, close))
-		}).collect::<io::Result<(Vec<_>)>>()?;
-		handles.push((eloop, close));
-		let (executors, close) = handles.into_iter().unzip();
+		let mut handles: Vec<(Executor, oneshot::Sender<()>, oneshot::Receiver<()>)> = handles
+			.into_iter()
+			.map(|(eloop, close, local_addr_rx, done_rx)| {
+				let _ = recv_address(local_addr_rx)?;
+				Ok((eloop, close, done_rx))
+			})
+			.collect::<io::Result<(Vec<_>)>>()?;
+		handles.push((eloop, close, done_rx));
+
+		let (executors, done_rxs) = handles
+			.into_iter()
+			.fold((vec![], vec![]), |mut acc, (eloop, closer, done_rx)| {
+				acc.0.push((eloop, closer));
+				acc.1.push(done_rx);
+				acc
+			});
 
 		Ok(Server {
 			address: local_addr?,
-			executor: Some(executors),
-			close: Some(close),
+			executors: Arc::new(Mutex::new(Some(executors))),
+			done: Some(done_rxs),
 		})
 	}
 }
 
 fn recv_address(local_addr_rx: mpsc::Receiver<io::Result<SocketAddr>>) -> io::Result<SocketAddr> {
-	local_addr_rx.recv().map_err(|_| {
-		io::Error::new(io::ErrorKind::Interrupted, "")
-	})?
+	local_addr_rx
+		.recv()
+		.map_err(|_| io::Error::new(io::ErrorKind::Interrupted, ""))?
 }
 
 fn serve<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>>(
-	signals: (oneshot::Receiver<()>, mpsc::Sender<io::Result<SocketAddr>>),
+	signals: (
+		oneshot::Receiver<()>,
+		mpsc::Sender<io::Result<SocketAddr>>,
+		oneshot::Sender<()>,
+	),
 	executor: tokio::runtime::TaskExecutor,
 	addr: SocketAddr,
 	cors_domains: CorsDomains,
 	cors_max_age: Option<u32>,
 	allowed_headers: cors::AccessControlAllowHeaders,
-	request_middleware: Arc<RequestMiddleware>,
+	request_middleware: Arc<dyn RequestMiddleware>,
 	allowed_hosts: AllowedHosts,
 	jsonrpc_handler: Rpc<M, S>,
 	rest_api: RestApi,
@@ -454,8 +486,8 @@ fn serve<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>>(
 	reuse_port: bool,
 	max_request_body_size: usize,
 ) {
-	let (shutdown_signal, local_addr_tx) = signals;
-	executor.spawn(future::lazy(move || {
+	let (shutdown_signal, local_addr_tx, done_tx) = signals;
+	executor.spawn({
 		let handle = tokio::reactor::Handle::default();
 
 		let bind = move || {
@@ -482,11 +514,14 @@ fn serve<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>>(
 				match local_addr_tx.send(Ok(local_addr)) {
 					Ok(_) => futures::future::ok((listener, local_addr)),
 					Err(_) => {
-						warn!("Thread {:?} unable to reach receiver, closing server", thread::current().name());
+						warn!(
+							"Thread {:?} unable to reach receiver, closing server",
+							thread::current().name()
+						);
 						futures::future::err(())
-					},
+					}
 				}
-			},
+			}
 			Err(err) => {
 				// Send error
 				let _send_result = local_addr_tx.send(Err(err));
@@ -495,41 +530,49 @@ fn serve<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>>(
 			}
 		};
 
-		bind_result.and_then(move |(listener, local_addr)| {
-			let allowed_hosts = server_utils::hosts::update(allowed_hosts, &local_addr);
+		bind_result
+			.and_then(move |(listener, local_addr)| {
+				let allowed_hosts = server_utils::hosts::update(allowed_hosts, &local_addr);
 
-			let mut http = server::conn::Http::new();
-			http.keep_alive(keep_alive);
-			let tcp_stream = SuspendableStream::new(listener.incoming());
+				let mut http = server::conn::Http::new();
+				http.keep_alive(keep_alive);
+				let tcp_stream = SuspendableStream::new(listener.incoming());
 
-			tcp_stream
-				.for_each(move |socket| {
-					let service = ServerHandler::new(
-						jsonrpc_handler.clone(),
-						cors_domains.clone(),
-						cors_max_age,
-						allowed_headers.clone(),
-						allowed_hosts.clone(),
-						request_middleware.clone(),
-						rest_api,
-						health_api.clone(),
-						max_request_body_size,
-						keep_alive,
-					);
-					tokio::spawn(http.serve_connection(socket, service)
-						.map_err(|e| error!("Error serving connection: {:?}", e)));
-					Ok(())
-				})
-				.map_err(|e| {
-					warn!("Incoming streams error, closing sever: {:?}", e);
-				})
-				.select(shutdown_signal.map_err(|e| {
-					debug!("Shutdown signaller dropped, closing server: {:?}", e);
-				}))
-				.map(|_| ())
-				.map_err(|_| ())
-		})
-	}));
+				tcp_stream
+					.map(move |socket| {
+						let service = ServerHandler::new(
+							jsonrpc_handler.clone(),
+							cors_domains.clone(),
+							cors_max_age,
+							allowed_headers.clone(),
+							allowed_hosts.clone(),
+							request_middleware.clone(),
+							rest_api,
+							health_api.clone(),
+							max_request_body_size,
+							keep_alive,
+						);
+
+						http.serve_connection(socket, service)
+							.map_err(|e| error!("Error serving connection: {:?}", e))
+					})
+					.buffer_unordered(1024)
+					.for_each(|_| Ok(()))
+					.map_err(|e| {
+						warn!("Incoming streams error, closing sever: {:?}", e);
+					})
+					.select(shutdown_signal.map_err(|e| {
+						debug!("Shutdown signaller dropped, closing server: {:?}", e);
+					}))
+					.map_err(|_| ())
+			})
+			.and_then(|(_, server)| {
+				// We drop the server first to prevent a situation where main thread terminates
+				// before the server is properly dropped (see #504 for more details)
+				drop(server);
+				done_tx.send(())
+			})
+	});
 }
 
 #[cfg(unix)]
@@ -545,17 +588,34 @@ fn configure_port(reuse: bool, tcp: &net2::TcpBuilder) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn configure_port(_reuse: bool, _tcp: &net2::TcpBuilder) -> io::Result<()> {
-    Ok(())
+	Ok(())
+}
+
+/// Handle used to close the server. Can be cloned and passed around to different threads and be used
+/// to close a server that is `wait()`ing.
+
+#[derive(Clone)]
+pub struct CloseHandle(Arc<Mutex<Option<Vec<(Executor, oneshot::Sender<()>)>>>>);
+
+impl CloseHandle {
+	/// Shutdown a running server
+	pub fn close(self) {
+		if let Some(executors) = self.0.lock().take() {
+			for (executor, closer) in executors {
+				executor.close();
+				let _ = closer.send(());
+			}
+		}
+	}
 }
 
 /// jsonrpc http server instance
 pub struct Server {
 	address: SocketAddr,
-	executor: Option<Vec<Executor>>,
-	close: Option<Vec<oneshot::Sender<()>>>,
+	executors: Arc<Mutex<Option<Vec<(Executor, oneshot::Sender<()>)>>>>,
+	done: Option<Vec<oneshot::Receiver<()>>>,
 }
 
-const PROOF: &'static str = "Server is always Some until self is consumed.";
 impl Server {
 	/// Returns address of this server
 	pub fn address(&self) -> &SocketAddr {
@@ -563,28 +623,28 @@ impl Server {
 	}
 
 	/// Closes the server.
-	pub fn close(mut self) {
-		for close in self.close.take().expect(PROOF) {
-			let _ = close.send(());
-		}
-
-		for executor in self.executor.take().expect(PROOF) {
-			executor.close();
-		}
+	pub fn close(self) {
+		self.close_handle().close()
 	}
 
 	/// Will block, waiting for the server to finish.
 	pub fn wait(mut self) {
-		for executor in self.executor.take().expect(PROOF) {
-			executor.wait();
+		if let Some(receivers) = self.done.take() {
+			for receiver in receivers {
+				let _ = receiver.wait();
+			}
 		}
+	}
+
+	/// Get a handle that allows us to close the server from a different thread and/or while the
+	/// server is `wait()`ing.
+	pub fn close_handle(&self) -> CloseHandle {
+		CloseHandle(self.executors.clone())
 	}
 }
 
 impl Drop for Server {
 	fn drop(&mut self) {
-		self.executor.take().map(|executors| {
-			for executor in executors { executor.close(); }
-		});
+		self.close_handle().close();
 	}
 }

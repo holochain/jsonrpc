@@ -1,7 +1,7 @@
 use jsonrpc_core;
 
-use jsonrpc_core::{IoHandler, Error, Result};
 use jsonrpc_core::futures::future::{self, FutureResult};
+use jsonrpc_core::{Error, IoHandler, Result};
 use jsonrpc_derive::rpc;
 
 #[rpc]
@@ -12,11 +12,11 @@ pub trait Rpc<One, Two> {
 
 	/// Adds two numbers and returns a result
 	#[rpc(name = "setTwo")]
-	fn set_two(&self, _: Two) -> Result<()>;
+	fn set_two(&self, a: Two) -> Result<()>;
 
 	/// Performs asynchronous operation
 	#[rpc(name = "beFancy")]
-	fn call(&self, _: One) -> FutureResult<(One, Two), Error>;
+	fn call(&self, a: One) -> FutureResult<(One, Two), Error>;
 }
 
 struct RpcImpl;
@@ -35,7 +35,6 @@ impl Rpc<u64, String> for RpcImpl {
 		crate::future::finished((num + 999, "hello".into()))
 	}
 }
-
 
 fn main() {
 	let mut io = IoHandler::new();

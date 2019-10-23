@@ -1,9 +1,10 @@
 [workspace]
 members = [
 	"core",
+	"core-client",
+	"core-client/transports",
 	"http",
 	"ipc",
-	"macros",
 	"derive",
 	"pubsub",
 	"pubsub/more-examples",
