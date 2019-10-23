@@ -1,20 +1,23 @@
-use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{
+	hash_map::{IntoIter, Iter},
+	HashMap,
+};
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
-use serde_json;
 use futures::{self, future, Future};
+use serde_json;
 
-use crate::calls::{RemoteProcedure, Metadata, RpcMethodSimple, RpcMethod, RpcNotificationSimple, RpcNotification};
+use crate::calls::{Metadata, RemoteProcedure, RpcMethod, RpcMethodSimple, RpcNotification, RpcNotificationSimple};
 use crate::middleware::{self, Middleware};
+use crate::types::{Call, Output, Request, Response};
 use crate::types::{Error, ErrorCode, Version};
-use crate::types::{Request, Response, Call, Output};
 
 /// A type representing middleware or RPC response before serialization.
-pub type FutureResponse = Box<Future<Item=Option<Response>, Error=()> + Send>;
+pub type FutureResponse = Box<dyn Future<Item = Option<Response>, Error = ()> + Send>;
 
 /// A type representing middleware or RPC call output.
-pub type FutureOutput = Box<Future<Item=Option<Output>, Error=()> + Send>;
+pub type FutureOutput = Box<dyn Future<Item = Option<Output>, Error = ()> + Send>;
 
 /// A type representing future string response.
 pub type FutureResult<F, G> = future::Map<
@@ -23,26 +26,14 @@ pub type FutureResult<F, G> = future::Map<
 >;
 
 /// A type representing a result of a single method call.
-pub type FutureRpcOutput<F> = future::Either<
-	F,
-	future::Either<
-		FutureOutput,
-		future::FutureResult<Option<Output>, ()>,
-	>,
->;
+pub type FutureRpcOutput<F> = future::Either<F, future::Either<FutureOutput, future::FutureResult<Option<Output>, ()>>>;
 
 /// A type representing an optional `Response` for RPC `Request`.
 pub type FutureRpcResult<F, G> = future::Either<
 	F,
 	future::Either<
-		future::Map<
-			FutureRpcOutput<G>,
-			fn(Option<Output>) -> Option<Response>,
-		>,
-		future::Map<
-			future::JoinAll<Vec<FutureRpcOutput<G>>>,
-			fn(Vec<Option<Output>>) -> Option<Response>,
-		>,
+		future::Map<FutureRpcOutput<G>, fn(Option<Output>) -> Option<Response>>,
+		future::Map<future::JoinAll<Vec<FutureRpcOutput<G>>>, fn(Vec<Option<Output>>) -> Option<Response>>,
 	>,
 >;
 
@@ -64,17 +55,15 @@ impl Default for Compatibility {
 }
 
 impl Compatibility {
-	fn is_version_valid(&self, version: Option<Version>) -> bool {
-		match (*self, version) {
-			(Compatibility::V1, None) |
-			(Compatibility::V2, Some(Version::V2)) |
-			(Compatibility::Both, _) => true,
+	fn is_version_valid(self, version: Option<Version>) -> bool {
+		match (self, version) {
+			(Compatibility::V1, None) | (Compatibility::V2, Some(Version::V2)) | (Compatibility::Both, _) => true,
 			_ => false,
 		}
 	}
 
-	fn default_version(&self) -> Option<Version> {
-		match *self {
+	fn default_version(self) -> Option<Version> {
+		match self {
 			Compatibility::V1 => None,
 			Compatibility::V2 | Compatibility::Both => Some(Version::V2),
 		}
@@ -84,7 +73,7 @@ impl Compatibility {
 /// Request handler
 ///
 /// By default compatible only with jsonrpc v2
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MetaIoHandler<T: Metadata, S: Middleware<T> = middleware::Noop> {
 	middleware: S,
 	compatibility: Compatibility,
@@ -97,24 +86,41 @@ impl<T: Metadata> Default for MetaIoHandler<T> {
 	}
 }
 
+impl<T: Metadata, S: Middleware<T>> IntoIterator for MetaIoHandler<T, S> {
+	type Item = (String, RemoteProcedure<T>);
+	type IntoIter = IntoIter<String, RemoteProcedure<T>>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.methods.into_iter()
+	}
+}
+
+impl<'a, T: Metadata, S: Middleware<T>> IntoIterator for &'a MetaIoHandler<T, S> {
+	type Item = (&'a String, &'a RemoteProcedure<T>);
+	type IntoIter = Iter<'a, String, RemoteProcedure<T>>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.methods.iter()
+	}
+}
+
 impl<T: Metadata> MetaIoHandler<T> {
 	/// Creates new `MetaIoHandler` compatible with specified protocol version.
 	pub fn with_compatibility(compatibility: Compatibility) -> Self {
 		MetaIoHandler {
-			compatibility: compatibility,
+			compatibility,
 			middleware: Default::default(),
 			methods: Default::default(),
 		}
 	}
 }
 
-
 impl<T: Metadata, S: Middleware<T>> MetaIoHandler<T, S> {
 	/// Creates new `MetaIoHandler`
 	pub fn new(compatibility: Compatibility, middleware: S) -> Self {
 		MetaIoHandler {
-			compatibility: compatibility,
-			middleware: middleware,
+			compatibility,
+			middleware,
 			methods: Default::default(),
 		}
 	}
@@ -123,67 +129,65 @@ impl<T: Metadata, S: Middleware<T>> MetaIoHandler<T, S> {
 	pub fn with_middleware(middleware: S) -> Self {
 		MetaIoHandler {
 			compatibility: Default::default(),
-			middleware: middleware,
+			middleware,
 			methods: Default::default(),
 		}
 	}
 
 	/// Adds an alias to a method.
 	pub fn add_alias(&mut self, alias: &str, other: &str) {
-		self.methods.insert(
-			alias.into(),
-			RemoteProcedure::Alias(other.into()),
-		);
+		self.methods.insert(alias.into(), RemoteProcedure::Alias(other.into()));
 	}
 
 	/// Adds new supported asynchronous method
-	pub fn add_method<F>(&mut self, name: &str, method: F) where
+	pub fn add_method<F>(&mut self, name: &str, method: F)
+	where
 		F: RpcMethodSimple,
 	{
-		self.add_method_with_meta(name, move |params, _meta| {
-			method.call(params)
-		})
+		self.add_method_with_meta(name, move |params, _meta| method.call(params))
 	}
 
 	/// Adds new supported notification
-	pub fn add_notification<F>(&mut self, name: &str, notification: F) where
+	pub fn add_notification<F>(&mut self, name: &str, notification: F)
+	where
 		F: RpcNotificationSimple,
 	{
 		self.add_notification_with_meta(name, move |params, _meta| notification.execute(params))
 	}
 
 	/// Adds new supported asynchronous method with metadata support.
-	pub fn add_method_with_meta<F>(&mut self, name: &str, method: F) where
+	pub fn add_method_with_meta<F>(&mut self, name: &str, method: F)
+	where
 		F: RpcMethod<T>,
 	{
-		self.methods.insert(
-			name.into(),
-			RemoteProcedure::Method(Arc::new(method)),
-		);
+		self.methods
+			.insert(name.into(), RemoteProcedure::Method(Arc::new(method)));
 	}
 
 	/// Adds new supported notification with metadata support.
-	pub fn add_notification_with_meta<F>(&mut self, name: &str, notification: F) where
+	pub fn add_notification_with_meta<F>(&mut self, name: &str, notification: F)
+	where
 		F: RpcNotification<T>,
 	{
-		self.methods.insert(
-			name.into(),
-			RemoteProcedure::Notification(Arc::new(notification)),
-		);
+		self.methods
+			.insert(name.into(), RemoteProcedure::Notification(Arc::new(notification)));
 	}
 
 	/// Extend this `MetaIoHandler` with methods defined elsewhere.
-	pub fn extend_with<F>(&mut self, methods: F) where
-		F: Into<HashMap<String, RemoteProcedure<T>>>
+	pub fn extend_with<F>(&mut self, methods: F)
+	where
+		F: IntoIterator<Item = (String, RemoteProcedure<T>)>,
 	{
-		self.methods.extend(methods.into())
+		self.methods.extend(methods)
 	}
 
 	/// Handle given request synchronously - will block until response is available.
 	/// If you have any asynchronous methods in your RPC it is much wiser to use
 	/// `handle_request` instead and deal with asynchronous requests in a non-blocking fashion.
 	pub fn handle_request_sync(&self, request: &str, meta: T) -> Option<String> {
-		self.handle_request(request, meta).wait().expect("Handler calls can never fail.")
+		self.handle_request(request, meta)
+			.wait()
+			.expect("Handler calls can never fail.")
 	}
 
 	/// Handle given request asynchronously.
@@ -201,7 +205,10 @@ impl<T: Metadata, S: Middleware<T>> MetaIoHandler<T, S> {
 		trace!(target: "rpc", "Request: {}.", request);
 		let request = read_request(request);
 		let result = match request {
-			Err(error) => A(futures::finished(Some(Response::from(error, self.compatibility.default_version())))),
+			Err(error) => A(futures::finished(Some(Response::from(
+				error,
+				self.compatibility.default_version(),
+			)))),
 			Ok(request) => B(self.handle_rpc_request(request, meta)),
 		};
 
@@ -225,17 +232,20 @@ impl<T: Metadata, S: Middleware<T>> MetaIoHandler<T, S> {
 			}
 		}
 
-		self.middleware.on_request(request, meta, |request, meta| match request {
-			Request::Single(call) => {
-				A(self.handle_call(call, meta).map(output_as_response as fn(Option<Output>) ->
-												   Option<Response>))
-			},
-			Request::Batch(calls) => {
-				let futures: Vec<_> = calls.into_iter().map(move |call| self.handle_call(call, meta.clone())).collect();
-				B(futures::future::join_all(futures).map(outputs_as_batch as fn(Vec<Option<Output>>) ->
-																				Option<Response>))
-			},
-		})
+		self.middleware
+			.on_request(request, meta, |request, meta| match request {
+				Request::Single(call) => A(self
+					.handle_call(call, meta)
+					.map(output_as_response as fn(Option<Output>) -> Option<Response>)),
+				Request::Batch(calls) => {
+					let futures: Vec<_> = calls
+						.into_iter()
+						.map(move |call| self.handle_call(call, meta.clone()))
+						.collect();
+					B(futures::future::join_all(futures)
+						.map(outputs_as_batch as fn(Vec<Option<Output>>) -> Option<Response>))
+				}
+			})
 	}
 
 	/// Handle single call asynchronously.
@@ -249,7 +259,7 @@ impl<T: Metadata, S: Middleware<T>> MetaIoHandler<T, S> {
 				let jsonrpc = method.jsonrpc;
 				let valid_version = self.compatibility.is_version_valid(jsonrpc);
 
-				let call_method = |method: &Arc<RpcMethod<T>>| {
+				let call_method = |method: &Arc<dyn RpcMethod<T>>| {
 					let method = method.clone();
 					futures::lazy(move || method.call(params, meta))
 				};
@@ -266,11 +276,11 @@ impl<T: Metadata, S: Middleware<T>> MetaIoHandler<T, S> {
 
 				match result {
 					Ok(result) => A(Box::new(
-						result.then(move |result| futures::finished(Some(Output::from(result, id, jsonrpc))))
+						result.then(move |result| futures::finished(Some(Output::from(result, id, jsonrpc)))),
 					) as _),
 					Err(err) => B(futures::finished(Some(Output::from(Err(err), id, jsonrpc)))),
 				}
-			},
+			}
 			Call::Notification(notification) => {
 				let params = notification.params;
 				let jsonrpc = notification.jsonrpc;
@@ -281,27 +291,105 @@ impl<T: Metadata, S: Middleware<T>> MetaIoHandler<T, S> {
 				match self.methods.get(&notification.method) {
 					Some(&RemoteProcedure::Notification(ref notification)) => {
 						notification.execute(params, meta);
-					},
+					}
 					Some(&RemoteProcedure::Alias(ref alias)) => {
 						if let Some(&RemoteProcedure::Notification(ref notification)) = self.methods.get(alias) {
 							notification.execute(params, meta);
 						}
-					},
-					_ => {},
+					}
+					_ => {}
 				}
 
 				B(futures::finished(None))
-			},
-			Call::Invalid { id } => {
-				B(futures::finished(Some(Output::invalid_request(id, self.compatibility.default_version()))))
-			},
+			}
+			Call::Invalid { id } => B(futures::finished(Some(Output::invalid_request(
+				id,
+				self.compatibility.default_version(),
+			)))),
 		})
+	}
+
+	/// Returns an iterator visiting all methods in arbitrary order.
+	pub fn iter(&self) -> impl Iterator<Item = (&String, &RemoteProcedure<T>)> {
+		self.methods.iter()
+	}
+}
+
+/// A type that can augment `MetaIoHandler`.
+///
+/// This allows your code to accept generic extensions for `IoHandler`
+/// and compose them to create the RPC server.
+pub trait IoHandlerExtension<M: Metadata = ()> {
+	/// Extend given `handler` with additional methods.
+	fn augment<S: Middleware<M>>(self, handler: &mut MetaIoHandler<M, S>);
+}
+
+macro_rules! impl_io_handler_extension {
+	($( $x:ident, )*) => {
+		impl<M, $( $x, )*> IoHandlerExtension<M> for ($( $x, )*) where
+			M: Metadata,
+			$(
+				$x: IoHandlerExtension<M>,
+			)*
+			{
+				#[allow(unused)]
+				fn augment<S: Middleware<M>>(self, handler: &mut MetaIoHandler<M, S>) {
+					#[allow(non_snake_case)]
+					let (
+						$( $x, )*
+					) = self;
+					$(
+						$x.augment(handler);
+					)*
+				}
+			}
+	}
+}
+
+impl_io_handler_extension!();
+impl_io_handler_extension!(A,);
+impl_io_handler_extension!(A, B,);
+impl_io_handler_extension!(A, B, C,);
+impl_io_handler_extension!(A, B, C, D,);
+impl_io_handler_extension!(A, B, C, D, E,);
+impl_io_handler_extension!(A, B, C, D, E, F,);
+impl_io_handler_extension!(A, B, C, D, E, F, G,);
+impl_io_handler_extension!(A, B, C, D, E, F, G, H,);
+impl_io_handler_extension!(A, B, C, D, E, F, G, H, I,);
+impl_io_handler_extension!(A, B, C, D, E, F, G, H, I, J,);
+impl_io_handler_extension!(A, B, C, D, E, F, G, H, I, J, K,);
+impl_io_handler_extension!(A, B, C, D, E, F, G, H, I, J, K, L,);
+
+impl<M: Metadata> IoHandlerExtension<M> for Vec<(String, RemoteProcedure<M>)> {
+	fn augment<S: Middleware<M>>(self, handler: &mut MetaIoHandler<M, S>) {
+		handler.methods.extend(self)
+	}
+}
+
+impl<M: Metadata> IoHandlerExtension<M> for HashMap<String, RemoteProcedure<M>> {
+	fn augment<S: Middleware<M>>(self, handler: &mut MetaIoHandler<M, S>) {
+		handler.methods.extend(self)
+	}
+}
+
+impl<M: Metadata, S2: Middleware<M>> IoHandlerExtension<M> for MetaIoHandler<M, S2> {
+	fn augment<S: Middleware<M>>(self, handler: &mut MetaIoHandler<M, S>) {
+		handler.methods.extend(self.methods)
 	}
 }
 
 /// Simplified `IoHandler` with no `Metadata` associated with each request.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IoHandler<M: Metadata = ()>(MetaIoHandler<M>);
+
+impl<T: Metadata> IntoIterator for IoHandler<T> {
+	type Item = <MetaIoHandler<T> as IntoIterator>::Item;
+	type IntoIter = <MetaIoHandler<T> as IntoIterator>::IntoIter;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.0.into_iter()
+	}
+}
 
 // Type inference helper
 impl IoHandler {
@@ -360,6 +448,12 @@ impl From<IoHandler> for MetaIoHandler<()> {
 	}
 }
 
+impl<M: Metadata> IoHandlerExtension<M> for IoHandler<M> {
+	fn augment<S: Middleware<M>>(self, handler: &mut MetaIoHandler<M, S>) {
+		handler.methods.extend(self.0.methods)
+	}
+}
+
 fn read_request(request_str: &str) -> Result<Request, Error> {
 	serde_json::from_str(request_str).map_err(|_| Error::new(ErrorCode::ParseError))
 }
@@ -371,17 +465,15 @@ fn write_response(response: Response) -> String {
 
 #[cfg(test)]
 mod tests {
+	use super::{Compatibility, IoHandler};
+	use crate::types::Value;
 	use futures;
-	use crate::types::{Value};
-	use super::{IoHandler, Compatibility};
 
 	#[test]
 	fn test_io_handler() {
 		let mut io = IoHandler::new();
 
-		io.add_method("say_hello", |_| {
-			Ok(Value::String("hello".to_string()))
-		});
+		io.add_method("say_hello", |_| Ok(Value::String("hello".to_string())));
 
 		let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23], "id": 1}"#;
 		let response = r#"{"jsonrpc":"2.0","result":"hello","id":1}"#;
@@ -393,9 +485,7 @@ mod tests {
 	fn test_io_handler_1dot0() {
 		let mut io = IoHandler::with_compatibility(Compatibility::Both);
 
-		io.add_method("say_hello", |_| {
-			Ok(Value::String("hello".to_string()))
-		});
+		io.add_method("say_hello", |_| Ok(Value::String("hello".to_string())));
 
 		let request = r#"{"method": "say_hello", "params": [42, 23], "id": 1}"#;
 		let response = r#"{"result":"hello","id":1}"#;
@@ -407,9 +497,7 @@ mod tests {
 	fn test_async_io_handler() {
 		let mut io = IoHandler::new();
 
-		io.add_method("say_hello", |_| {
-			futures::finished(Value::String("hello".to_string()))
-		});
+		io.add_method("say_hello", |_| futures::finished(Value::String("hello".to_string())));
 
 		let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23], "id": 1}"#;
 		let response = r#"{"jsonrpc":"2.0","result":"hello","id":1}"#;
@@ -419,8 +507,8 @@ mod tests {
 
 	#[test]
 	fn test_notification() {
-		use std::sync::Arc;
 		use std::sync::atomic;
+		use std::sync::Arc;
 
 		let mut io = IoHandler::new();
 
@@ -448,11 +536,8 @@ mod tests {
 	#[test]
 	fn test_method_alias() {
 		let mut io = IoHandler::new();
-		io.add_method("say_hello", |_| {
-			Ok(Value::String("hello".to_string()))
-		});
+		io.add_method("say_hello", |_| Ok(Value::String("hello".to_string())));
 		io.add_alias("say_hello_alias", "say_hello");
-
 
 		let request = r#"{"jsonrpc": "2.0", "method": "say_hello_alias", "params": [42, 23], "id": 1}"#;
 		let response = r#"{"jsonrpc":"2.0","result":"hello","id":1}"#;
@@ -462,8 +547,8 @@ mod tests {
 
 	#[test]
 	fn test_notification_alias() {
-		use std::sync::Arc;
 		use std::sync::atomic;
+		use std::sync::Arc;
 
 		let mut io = IoHandler::new();
 
@@ -480,9 +565,28 @@ mod tests {
 	}
 
 	#[test]
+	fn test_batch_notification() {
+		use std::sync::atomic;
+		use std::sync::Arc;
+
+		let mut io = IoHandler::new();
+
+		let called = Arc::new(atomic::AtomicBool::new(false));
+		let c = called.clone();
+		io.add_notification("say_hello", move |_| {
+			c.store(true, atomic::Ordering::SeqCst);
+		});
+
+		let request = r#"[{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23]}]"#;
+		assert_eq!(io.handle_request_sync(request), None);
+		assert_eq!(called.load(atomic::Ordering::SeqCst), true);
+	}
+
+	#[test]
 	fn test_send_sync() {
-		fn is_send_sync<T>(_obj: T) -> bool where
-			T: Send + Sync
+		fn is_send_sync<T>(_obj: T) -> bool
+		where
+			T: Send + Sync,
 		{
 			true
 		}
@@ -490,5 +594,31 @@ mod tests {
 		let io = IoHandler::new();
 
 		assert!(is_send_sync(io))
+	}
+
+	#[test]
+	fn test_extending_by_multiple_delegates() {
+		use super::IoHandlerExtension;
+		use crate::delegates::IoDelegate;
+		use std::sync::Arc;
+
+		struct Test;
+		impl Test {
+			fn abc(&self, _p: crate::Params) -> Result<Value, crate::Error> {
+				Ok(5.into())
+			}
+		}
+
+		let mut io = IoHandler::new();
+		let mut del1 = IoDelegate::new(Arc::new(Test));
+		del1.add_method("rpc_test", Test::abc);
+		let mut del2 = IoDelegate::new(Arc::new(Test));
+		del2.add_method("rpc_test", Test::abc);
+
+		fn augment<X: IoHandlerExtension>(x: X, io: &mut IoHandler) {
+			x.augment(io);
+		}
+
+		augment((del1, del2), &mut io);
 	}
 }

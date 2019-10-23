@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::core;
 use crate::server_utils;
 use crate::server_utils::cors::Origin;
-use crate::server_utils::hosts::{Host, DomainsValidation};
+use crate::server_utils::hosts::{DomainsValidation, Host};
 use crate::server_utils::reactor::UninitializedExecutor;
 use crate::server_utils::session::SessionStats;
 
@@ -16,11 +16,11 @@ use crate::session;
 /// Builder for `WebSockets` server
 pub struct ServerBuilder<M: core::Metadata, S: core::Middleware<M>> {
 	handler: Arc<core::MetaIoHandler<M, S>>,
-	meta_extractor: Arc<MetaExtractor<M>>,
+	meta_extractor: Arc<dyn MetaExtractor<M>>,
 	allowed_origins: Option<Vec<Origin>>,
 	allowed_hosts: Option<Vec<Host>>,
-	request_middleware: Option<Arc<session::RequestMiddleware>>,
-	session_stats: Option<Arc<SessionStats>>,
+	request_middleware: Option<Arc<dyn session::RequestMiddleware>>,
+	session_stats: Option<Arc<dyn SessionStats>>,
 	executor: UninitializedExecutor,
 	max_connections: usize,
 	max_payload_bytes: usize,
@@ -28,7 +28,8 @@ pub struct ServerBuilder<M: core::Metadata, S: core::Middleware<M>> {
 
 impl<M: core::Metadata + Default, S: core::Middleware<M>> ServerBuilder<M, S> {
 	/// Creates new `ServerBuilder`
-	pub fn new<T>(handler: T) -> Self where
+	pub fn new<T>(handler: T) -> Self
+	where
 		T: Into<core::MetaIoHandler<M, S>>,
 	{
 		Self::with_meta_extractor(handler, NoopExtractor)
@@ -37,7 +38,8 @@ impl<M: core::Metadata + Default, S: core::Middleware<M>> ServerBuilder<M, S> {
 
 impl<M: core::Metadata, S: core::Middleware<M>> ServerBuilder<M, S> {
 	/// Creates new `ServerBuilder`
-	pub fn with_meta_extractor<T, E>(handler: T, extractor: E) -> Self where
+	pub fn with_meta_extractor<T, E>(handler: T, extractor: E) -> Self
+	where
 		T: Into<core::MetaIoHandler<M, S>>,
 		E: MetaExtractor<M>,
 	{
@@ -121,5 +123,4 @@ impl<M: core::Metadata, S: core::Middleware<M>> ServerBuilder<M, S> {
 			self.max_payload_bytes,
 		)
 	}
-
 }

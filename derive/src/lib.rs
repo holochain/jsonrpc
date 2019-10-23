@@ -9,16 +9,16 @@
 //! use jsonrpc_core::{IoHandler, Error, Result};
 //! use jsonrpc_core::futures::future::{self, FutureResult};
 //!
-//! #[rpc]
+//! #[rpc(server)]
 //! pub trait Rpc {
 //! 	#[rpc(name = "protocolVersion")]
 //! 	fn protocol_version(&self) -> Result<String>;
 //!
 //! 	#[rpc(name = "add")]
-//! 	fn add(&self, _: u64, _: u64) -> Result<u64>;
+//! 	fn add(&self, a: u64, b: u64) -> Result<u64>;
 //!
 //! 	#[rpc(name = "callAsync")]
-//! 	fn call(&self, _: u64) -> FutureResult<String, Error>;
+//! 	fn call(&self, a: u64) -> FutureResult<String, Error>;
 //! }
 //!
 //! struct RpcImpl;
@@ -71,7 +71,7 @@
 //! 		name = "hello_subscribe",
 //! 		alias("hello_sub")
 //! 	)]
-//!		fn subscribe(&self, _: Self::Metadata, _: Subscriber<String>, _: u64);
+//!		fn subscribe(&self, _: Self::Metadata, _: Subscriber<String>, param: u64);
 //!
 //!		/// Unsubscribe from hello subscription.
 //!		#[pubsub(
@@ -123,8 +123,61 @@
 //!
 //! # fn main() {}
 //! ```
+//!
+//! Client Example
+//!
+//! ```
+//! use jsonrpc_core_client::transports::local;
+//! use jsonrpc_core::futures::future::{self, Future, FutureResult};
+//! use jsonrpc_core::{Error, IoHandler, Result};
+//! use jsonrpc_derive::rpc;
+//!
+//! /// Rpc trait
+//! #[rpc]
+//! pub trait Rpc {
+//! 	/// Returns a protocol version
+//! 	#[rpc(name = "protocolVersion")]
+//! 	fn protocol_version(&self) -> Result<String>;
+//!
+//! 	/// Adds two numbers and returns a result
+//! 	#[rpc(name = "add", alias("callAsyncMetaAlias"))]
+//! 	fn add(&self, a: u64, b: u64) -> Result<u64>;
+//!
+//! 	/// Performs asynchronous operation
+//! 	#[rpc(name = "callAsync")]
+//! 	fn call(&self, a: u64) -> FutureResult<String, Error>;
+//! }
+//!
+//! struct RpcImpl;
+//!
+//! impl Rpc for RpcImpl {
+//! 	fn protocol_version(&self) -> Result<String> {
+//! 		Ok("version1".into())
+//! 	}
+//!
+//! 	fn add(&self, a: u64, b: u64) -> Result<u64> {
+//! 		Ok(a + b)
+//! 	}
+//!
+//! 	fn call(&self, _: u64) -> FutureResult<String, Error> {
+//! 		future::ok("OK".to_owned())
+//! 	}
+//! }
+//!
+//! fn main() {
+//! 	let mut io = IoHandler::new();
+//! 	io.extend_with(RpcImpl.to_delegate());
+//!
+//! 	let fut = {
+//! 		let (client, server) = local::connect::<gen_client::Client, _, _>(io);
+//! 		client.add(5, 6).map(|res| println!("5 + 6 = {}", res)).join(server)
+//! 	};
+//! 	fut.wait().unwrap();
+//! }
+//!
+//! ```
 
-#![recursion_limit = "128"]
+#![recursion_limit = "256"]
 #![warn(missing_docs)]
 
 extern crate proc_macro;
@@ -132,8 +185,10 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use syn::parse_macro_input;
 
+mod options;
 mod rpc_attr;
 mod rpc_trait;
+mod to_client;
 mod to_delegate;
 
 /// Apply `#[rpc]` to a trait, and a `to_delegate` method is generated which
@@ -141,10 +196,15 @@ mod to_delegate;
 /// Attach the delegate to an `IoHandler` and the methods are now callable
 /// via JSON-RPC.
 #[proc_macro_attribute]
-pub fn rpc(_args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn rpc(args: TokenStream, input: TokenStream) -> TokenStream {
 	let input_toks = parse_macro_input!(input as syn::Item);
 
-	match rpc_trait::rpc_impl( input_toks) {
+	let options = match options::DeriveOptions::try_from(args) {
+		Ok(options) => options,
+		Err(error) => return error.to_compile_error().into(),
+	};
+
+	match rpc_trait::rpc_impl(input_toks, options) {
 		Ok(output) => output.into(),
 		Err(err) => err.to_compile_error().into(),
 	}

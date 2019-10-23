@@ -1,6 +1,7 @@
-use serde_json;
-use jsonrpc_derive::rpc;
+use jsonrpc_core::types::params::Params;
 use jsonrpc_core::{IoHandler, Response};
+use jsonrpc_derive::rpc;
+use serde_json;
 
 pub enum MyError {}
 impl From<MyError> for jsonrpc_core::Error {
@@ -13,17 +14,25 @@ type Result<T> = ::std::result::Result<T, MyError>;
 
 #[rpc]
 pub trait Rpc {
-	/// Returns a protocol version
+	/// Returns a protocol version.
 	#[rpc(name = "protocolVersion")]
 	fn protocol_version(&self) -> Result<String>;
 
-	/// Negates number and returns a result
+	/// Negates number and returns a result.
 	#[rpc(name = "neg")]
-	fn neg(&self, _: i64) -> Result<i64>;
+	fn neg(&self, a: i64) -> Result<i64>;
 
-	/// Adds two numbers and returns a result
+	/// Adds two numbers and returns a result.
 	#[rpc(name = "add", alias("add_alias1", "add_alias2"))]
-	fn add(&self, _: u64, _: u64) -> Result<u64>;
+	fn add(&self, a: u64, b: u64) -> Result<u64>;
+
+	/// Retrieves and debug prints the underlying `Params` object.
+	#[rpc(name = "raw", raw_params)]
+	fn raw(&self, params: Params) -> Result<String>;
+
+	/// Handles a notification.
+	#[rpc(name = "notify")]
+	fn notify(&self, a: u64);
 }
 
 #[derive(Default)]
@@ -40,6 +49,14 @@ impl Rpc for RpcImpl {
 
 	fn add(&self, a: u64, b: u64) -> Result<u64> {
 		Ok(a + b)
+	}
+
+	fn raw(&self, _params: Params) -> Result<String> {
+		Ok("OK".into())
+	}
+
+	fn notify(&self, a: u64) {
+		println!("Received `notify` with value: {}", a);
 	}
 }
 
@@ -88,11 +105,17 @@ fn should_accept_single_param() {
 
 	// then
 	let result1: Response = serde_json::from_str(&res1.unwrap()).unwrap();
-	assert_eq!(result1, serde_json::from_str(r#"{
+	assert_eq!(
+		result1,
+		serde_json::from_str(
+			r#"{
 		"jsonrpc": "2.0",
 		"result": -1,
 		"id": 1
-	}"#).unwrap());
+	}"#
+		)
+		.unwrap()
+	);
 }
 
 #[test]
@@ -108,11 +131,17 @@ fn should_accept_multiple_params() {
 
 	// then
 	let result1: Response = serde_json::from_str(&res1.unwrap()).unwrap();
-	assert_eq!(result1, serde_json::from_str(r#"{
+	assert_eq!(
+		result1,
+		serde_json::from_str(
+			r#"{
 		"jsonrpc": "2.0",
 		"result": 3,
 		"id": 1
-	}"#).unwrap());
+	}"#
+		)
+		.unwrap()
+	);
 }
 
 #[test]
@@ -130,17 +159,98 @@ fn should_use_method_name_aliases() {
 
 	// then
 	let result1: Response = serde_json::from_str(&res1.unwrap()).unwrap();
-	assert_eq!(result1, serde_json::from_str(r#"{
+	assert_eq!(
+		result1,
+		serde_json::from_str(
+			r#"{
 		"jsonrpc": "2.0",
 		"result": 3,
 		"id": 1
-	}"#).unwrap());
+	}"#
+		)
+		.unwrap()
+	);
 
 	let result2: Response = serde_json::from_str(&res2.unwrap()).unwrap();
-	assert_eq!(result2, serde_json::from_str(r#"{
+	assert_eq!(
+		result2,
+		serde_json::from_str(
+			r#"{
 		"jsonrpc": "2.0",
 		"result": 3,
 		"id": 1
-	}"#).unwrap());
+	}"#
+		)
+		.unwrap()
+	);
 }
 
+#[test]
+fn should_accept_any_raw_params() {
+	let mut io = IoHandler::new();
+	let rpc = RpcImpl::default();
+	io.extend_with(rpc.to_delegate());
+
+	// when
+	let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"raw","params":[1, 2]}"#;
+	let req2 = r#"{"jsonrpc":"2.0","id":1,"method":"raw","params":{"foo":"bar"}}"#;
+	let req3 = r#"{"jsonrpc":"2.0","id":1,"method":"raw","params":null}"#;
+	let req4 = r#"{"jsonrpc":"2.0","id":1,"method":"raw"}"#;
+
+	let res1 = io.handle_request_sync(req1);
+	let res2 = io.handle_request_sync(req2);
+	let res3 = io.handle_request_sync(req3);
+	let res4 = io.handle_request_sync(req4);
+	let expected = r#"{
+		"jsonrpc": "2.0",
+		"result": "OK",
+		"id": 1
+	}"#;
+	let expected: Response = serde_json::from_str(expected).unwrap();
+
+	// then
+	let result1: Response = serde_json::from_str(&res1.unwrap()).unwrap();
+	assert_eq!(expected, result1);
+
+	let result2: Response = serde_json::from_str(&res2.unwrap()).unwrap();
+	assert_eq!(expected, result2);
+
+	let result3: Response = serde_json::from_str(&res3.unwrap()).unwrap();
+	assert_eq!(expected, result3);
+
+	let result4: Response = serde_json::from_str(&res4.unwrap()).unwrap();
+	assert_eq!(expected, result4);
+}
+
+#[test]
+fn should_accept_only_notifications() {
+	let mut io = IoHandler::new();
+	let rpc = RpcImpl::default();
+	io.extend_with(rpc.to_delegate());
+
+	// when
+	let req1 = r#"{"jsonrpc":"2.0","method":"notify","params":[1]}"#;
+	let req2 = r#"{"jsonrpc":"2.0","id":1,"method":"notify","params":[1]}"#;
+
+	let res1 = io.handle_request_sync(req1);
+	let res2 = io.handle_request_sync(req2);
+
+	// then
+	assert!(res1.is_none());
+
+	let result2: Response = serde_json::from_str(&res2.unwrap()).unwrap();
+	assert_eq!(
+		result2,
+		serde_json::from_str(
+			r#"{
+		"jsonrpc": "2.0",
+		"error": {
+			"code": -32601,
+			"message": "Method not found"
+		},
+		"id":1
+	}"#
+		)
+		.unwrap()
+	);
+}

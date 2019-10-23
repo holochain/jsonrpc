@@ -1,23 +1,28 @@
-use std::collections::HashMap;
+use crate::options::DeriveOptions;
+use crate::rpc_attr::{AttributeKind, PubSubMethodKind, RpcMethodAttribute};
+use crate::to_client::generate_client_module;
+use crate::to_delegate::{generate_trait_item_method, MethodRegistration, RpcMethod};
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use std::collections::HashMap;
 use syn::{
-	parse_quote, Token, punctuated::Punctuated,
-	fold::{self, Fold}, Result,
+	fold::{self, Fold},
+	parse_quote,
+	punctuated::Punctuated,
+	Error, Ident, Result, Token,
 };
-use crate::rpc_attr::{RpcMethodAttribute, PubSubMethodKind, AttributeKind};
-use crate::to_delegate::{RpcMethod, MethodRegistration, generate_trait_item_method};
 
-const METADATA_TYPE: &'static str = "Metadata";
+const METADATA_TYPE: &str = "Metadata";
 
-const MISSING_SUBSCRIBE_METHOD_ERR: &'static str =
+const MISSING_SUBSCRIBE_METHOD_ERR: &str =
 	"Can't find subscribe method, expected a method annotated with `subscribe` \
-	e.g. `#[pubsub(subscription = \"hello\", subscribe, name = \"hello_subscribe\")]`";
+	 e.g. `#[pubsub(subscription = \"hello\", subscribe, name = \"hello_subscribe\")]`";
 
-const MISSING_UNSUBSCRIBE_METHOD_ERR: &'static str =
+const MISSING_UNSUBSCRIBE_METHOD_ERR: &str =
 	"Can't find unsubscribe method, expected a method annotated with `unsubscribe` \
-	e.g. `#[pubsub(subscription = \"hello\", unsubscribe, name = \"hello_unsubscribe\")]`";
+	 e.g. `#[pubsub(subscription = \"hello\", unsubscribe, name = \"hello_unsubscribe\")]`";
 
-const RPC_MOD_NAME_PREFIX: &'static str = "rpc_impl_";
+const RPC_MOD_NAME_PREFIX: &str = "rpc_impl_";
 
 struct RpcTrait {
 	has_pubsub_methods: bool,
@@ -27,15 +32,13 @@ struct RpcTrait {
 
 impl<'a> Fold for RpcTrait {
 	fn fold_trait_item_method(&mut self, method: syn::TraitItemMethod) -> syn::TraitItemMethod {
-		let mut method = method.clone();
-		let method_item = method.clone();
+		let mut foldable_method = method.clone();
 		// strip rpc attributes
-		method.attrs.retain(|a| {
-			let rpc_method =
-				self.methods.iter().find(|m| m.trait_item == method_item);
+		foldable_method.attrs.retain(|a| {
+			let rpc_method = self.methods.iter().find(|m| m.trait_item == method);
 			rpc_method.map_or(true, |rpc| rpc.attr.attr != *a)
 		});
-		fold::fold_trait_item_method(self, method)
+		fold::fold_trait_item_method(self, foldable_method)
 	}
 
 	fn fold_trait_item_type(&mut self, ty: syn::TraitItemType) -> syn::TraitItemType {
@@ -53,17 +56,14 @@ impl<'a> Fold for RpcTrait {
 	}
 }
 
-fn generate_rpc_item_trait(item_trait: &syn::ItemTrait) -> Result<(syn::ItemTrait, bool)> {
-	let methods_result: Result<Vec<_>> = item_trait.items
+fn compute_method_registrations(item_trait: &syn::ItemTrait) -> Result<(Vec<MethodRegistration>, Vec<RpcMethod>)> {
+	let methods_result: Result<Vec<_>> = item_trait
+		.items
 		.iter()
 		.filter_map(|trait_item| {
 			if let syn::TraitItem::Method(method) = trait_item {
-				match RpcMethodAttribute::parse_attr(&method) {
-					Ok(Some(attr)) =>
-						Some(Ok(RpcMethod::new(
-							attr.clone(),
-							method.clone(),
-						))),
+				match RpcMethodAttribute::parse_attr(method) {
+					Ok(Some(attr)) => Some(Ok(RpcMethod::new(attr, method.clone()))),
 					Ok(None) => None, // non rpc annotated trait method
 					Err(err) => Some(Err(syn::Error::new_spanned(method, err))),
 				}
@@ -73,21 +73,33 @@ fn generate_rpc_item_trait(item_trait: &syn::ItemTrait) -> Result<(syn::ItemTrai
 		})
 		.collect();
 	let methods = methods_result?;
-	let has_pubsub_methods = methods.iter().any(RpcMethod::is_pubsub);
-	let mut rpc_trait = RpcTrait { methods: methods.clone(), has_pubsub_methods, has_metadata: false };
-	let mut item_trait = fold::fold_item_trait(&mut rpc_trait, item_trait.clone());
 
 	let mut pubsub_method_pairs: HashMap<String, (Option<RpcMethod>, Option<RpcMethod>)> = HashMap::new();
 	let mut method_registrations: Vec<MethodRegistration> = Vec::new();
 
 	for method in methods.iter() {
 		match &method.attr().kind {
-			AttributeKind::Rpc { has_metadata } =>
-				method_registrations.push(MethodRegistration::Standard {
-					method: method.clone(),
-					has_metadata: *has_metadata
-				}),
-			AttributeKind::PubSub { subscription_name, kind } => {
+			AttributeKind::Rpc {
+				has_metadata,
+				is_notification,
+				..
+			} => {
+				if *is_notification {
+					method_registrations.push(MethodRegistration::Notification {
+						method: method.clone(),
+						has_metadata: *has_metadata,
+					})
+				} else {
+					method_registrations.push(MethodRegistration::Standard {
+						method: method.clone(),
+						has_metadata: *has_metadata,
+					})
+				}
+			}
+			AttributeKind::PubSub {
+				subscription_name,
+				kind,
+			} => {
 				let (ref mut sub, ref mut unsub) = pubsub_method_pairs
 					.entry(subscription_name.clone())
 					.or_insert((None, None));
@@ -96,48 +108,103 @@ fn generate_rpc_item_trait(item_trait: &syn::ItemTrait) -> Result<(syn::ItemTrai
 						if sub.is_none() {
 							*sub = Some(method.clone())
 						} else {
-							return Err(syn::Error::new_spanned(&method.trait_item,
-								format!("Subscription '{}' subscribe method is already defined", subscription_name)))
+							return Err(syn::Error::new_spanned(
+								&method.trait_item,
+								format!(
+									"Subscription '{}' subscribe method is already defined",
+									subscription_name
+								),
+							));
 						}
-					},
+					}
 					PubSubMethodKind::Unsubscribe => {
 						if unsub.is_none() {
 							*unsub = Some(method.clone())
 						} else {
-							return Err(syn::Error::new_spanned(&method.trait_item,
-								format!("Subscription '{}' unsubscribe method is already defined", subscription_name)))
+							return Err(syn::Error::new_spanned(
+								&method.trait_item,
+								format!(
+									"Subscription '{}' unsubscribe method is already defined",
+									subscription_name
+								),
+							));
 						}
-					},
+					}
 				}
-			},
+			}
 		}
 	}
 
 	for (name, pair) in pubsub_method_pairs {
 		match pair {
-			(Some(subscribe), Some(unsubscribe)) =>
-				method_registrations.push(MethodRegistration::PubSub {
-					name: name.clone(),
-					subscribe: subscribe.clone(),
-					unsubscribe: unsubscribe.clone()
-				}),
-			(Some(method), None) => return Err(syn::Error::new_spanned(&method.trait_item,
-				format!("subscription '{}'. {}", name, MISSING_UNSUBSCRIBE_METHOD_ERR))),
-			(None, Some(method)) => return Err(syn::Error::new_spanned(&method.trait_item,
-				format!("subscription '{}'. {}", name, MISSING_SUBSCRIBE_METHOD_ERR))),
+			(Some(subscribe), Some(unsubscribe)) => method_registrations.push(MethodRegistration::PubSub {
+				name: name.clone(),
+				subscribe: subscribe.clone(),
+				unsubscribe: unsubscribe.clone(),
+			}),
+			(Some(method), None) => {
+				return Err(syn::Error::new_spanned(
+					&method.trait_item,
+					format!("subscription '{}'. {}", name, MISSING_UNSUBSCRIBE_METHOD_ERR),
+				));
+			}
+			(None, Some(method)) => {
+				return Err(syn::Error::new_spanned(
+					&method.trait_item,
+					format!("subscription '{}'. {}", name, MISSING_SUBSCRIBE_METHOD_ERR),
+				));
+			}
 			(None, None) => unreachable!(),
 		}
 	}
 
-	let to_delegate_method =
-		generate_trait_item_method(&method_registrations, &item_trait, rpc_trait.has_metadata, has_pubsub_methods);
-	item_trait.items.push(syn::TraitItem::Method(to_delegate_method));
+	Ok((method_registrations, methods))
+}
 
-	let trait_bounds: Punctuated<syn::TypeParamBound, Token![+]> =
-		parse_quote!(Sized + Send + Sync + 'static);
-	item_trait.supertraits.extend(trait_bounds);
+fn generate_server_module(
+	method_registrations: &[MethodRegistration],
+	item_trait: &syn::ItemTrait,
+	methods: &[RpcMethod],
+) -> Result<TokenStream> {
+	let has_pubsub_methods = methods.iter().any(RpcMethod::is_pubsub);
 
-	Ok((item_trait, has_pubsub_methods))
+	let mut rpc_trait = RpcTrait {
+		methods: methods.to_owned(),
+		has_pubsub_methods,
+		has_metadata: false,
+	};
+	let mut rpc_server_trait = fold::fold_item_trait(&mut rpc_trait, item_trait.clone());
+
+	let to_delegate_method = generate_trait_item_method(
+		&method_registrations,
+		&rpc_server_trait,
+		rpc_trait.has_metadata,
+		has_pubsub_methods,
+	)?;
+
+	rpc_server_trait.items.push(syn::TraitItem::Method(to_delegate_method));
+
+	let trait_bounds: Punctuated<syn::TypeParamBound, Token![+]> = parse_quote!(Sized + Send + Sync + 'static);
+	rpc_server_trait.supertraits.extend(trait_bounds);
+
+	let optional_pubsub_import = if has_pubsub_methods {
+		crate_name("jsonrpc-pubsub").map(|pubsub_name| quote!(use #pubsub_name as _jsonrpc_pubsub;))
+	} else {
+		Ok(quote!())
+	}?;
+
+	let rpc_server_module = quote! {
+		/// The generated server module.
+		pub mod gen_server {
+			#optional_pubsub_import
+			use self::_jsonrpc_core::futures as _futures;
+			use super::*;
+
+			#rpc_server_trait
+		}
+	};
+
+	Ok(rpc_server_module)
 }
 
 fn rpc_wrapper_mod_name(rpc_trait: &syn::ItemTrait) -> syn::Ident {
@@ -146,34 +213,53 @@ fn rpc_wrapper_mod_name(rpc_trait: &syn::ItemTrait) -> syn::Ident {
 	syn::Ident::new(&mod_name, proc_macro2::Span::call_site())
 }
 
-pub fn rpc_impl(input: syn::Item) -> Result<proc_macro2::TokenStream> {
+pub fn crate_name(name: &str) -> Result<Ident> {
+	proc_macro_crate::crate_name(name)
+		.map(|name| Ident::new(&name, Span::call_site()))
+		.map_err(|e| Error::new(Span::call_site(), &e))
+}
+
+pub fn rpc_impl(input: syn::Item, options: DeriveOptions) -> Result<proc_macro2::TokenStream> {
 	let rpc_trait = match input {
 		syn::Item::Trait(item_trait) => item_trait,
-		item @ _ => return Err(syn::Error::new_spanned(item, "The #[rpc] custom attribute only works with trait declarations")),
+		item => {
+			return Err(syn::Error::new_spanned(
+				item,
+				"The #[rpc] custom attribute only works with trait declarations",
+			));
+		}
 	};
 
-	let (rpc_trait, has_pubsub_methods) = generate_rpc_item_trait(&rpc_trait)?;
+	let (method_registrations, methods) = compute_method_registrations(&rpc_trait)?;
 
 	let name = rpc_trait.ident.clone();
 	let mod_name_ident = rpc_wrapper_mod_name(&rpc_trait);
 
-	let optional_pubsub_import =
-		if has_pubsub_methods {
-			quote!(use jsonrpc_pubsub as _jsonrpc_pubsub;)
-		} else {
-			quote!()
-		};
+	let core_name = crate_name("jsonrpc-core")?;
 
-	Ok(quote! {
+	let mut submodules = Vec::new();
+	let mut exports = Vec::new();
+	if options.enable_client {
+		let rpc_client_module = generate_client_module(&method_registrations, &rpc_trait)?;
+		submodules.push(rpc_client_module);
+		exports.push(quote! {
+			pub use self::#mod_name_ident::gen_client;
+		});
+	}
+	if options.enable_server {
+		let rpc_server_module = generate_server_module(&method_registrations, &rpc_trait, &methods)?;
+		submodules.push(rpc_server_module);
+		exports.push(quote! {
+			pub use self::#mod_name_ident::gen_server::#name;
+		});
+	}
+	Ok(quote!(
 		mod #mod_name_ident {
-			use jsonrpc_core as _jsonrpc_core;
-			#optional_pubsub_import
-			use serde as _serde;
+			use #core_name as _jsonrpc_core;
 			use super::*;
-			use self::_jsonrpc_core::futures as _futures;
 
-			#rpc_trait
+			#(#submodules)*
 		}
-		pub use self::#mod_name_ident::#name;
-	})
+		#(#exports)*
+	))
 }

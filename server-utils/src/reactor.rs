@@ -1,10 +1,12 @@
 //! Event Loop Executor
+//!
 //! Either spawns a new event loop, or re-uses provided one.
+//! Spawned event loop is always single threaded (mostly for
+//! historical/backward compatibility reasons) despite the fact
+//! that `tokio::runtime` can be multi-threaded.
 
-use std::{io, thread};
-use std::sync::mpsc;
+use std::io;
 use tokio;
-use num_cpus;
 
 use crate::core::futures::{self, Future};
 
@@ -82,7 +84,7 @@ impl Executor {
 pub struct RpcEventLoop {
 	executor: tokio::runtime::TaskExecutor,
 	close: Option<futures::Complete<()>>,
-	handle: Option<thread::JoinHandle<()>>,
+	handle: Option<tokio::runtime::Shutdown>,
 }
 
 impl Drop for RpcEventLoop {
@@ -100,42 +102,21 @@ impl RpcEventLoop {
 	/// Spawns a new named thread with the `EventLoop`.
 	pub fn with_name(name: Option<String>) -> io::Result<Self> {
 		let (stop, stopped) = futures::oneshot();
-		let (tx, rx) = mpsc::channel();
-		let mut tb = thread::Builder::new();
+
+		let mut tb = tokio::runtime::Builder::new();
+		tb.core_threads(1);
+
 		if let Some(name) = name {
-			tb = tb.name(name);
+			tb.name_prefix(name);
 		}
 
-		let handle = tb.spawn(move || {
-			let core_threads = match num_cpus::get_physical() {
-				1 => 1,
-				2..=4 => 2,
-				_ => 3,
-			};
+		let mut runtime = tb.build()?;
+		let executor = runtime.executor();
+		let terminate = futures::empty().select(stopped).map(|_| ()).map_err(|_| ());
+		runtime.spawn(terminate);
+		let handle = runtime.shutdown_on_idle();
 
-			let runtime = tokio::runtime::Builder::new()
-				.core_threads(core_threads)
-				.name_prefix("jsonrpc-eventloop-")
-				.build();
-
-			match runtime {
-				Ok(mut runtime) => {
-					tx.send(Ok(runtime.executor())).expect("Rx is blocking upper thread.");
-					let terminate = futures::empty().select(stopped)
-						.map(|_| ())
-						.map_err(|_| ());
-					runtime.spawn(terminate);
-					runtime.shutdown_on_idle().wait().unwrap();
-				},
-				Err(err) => {
-					tx.send(Err(err)).expect("Rx is blocking upper thread.");
-				}
-			}
-		}).expect("Couldn't spawn a thread.");
-
-		let exec = rx.recv().expect("tx is transfered to a newly spawned thread.");
-
-		exec.map(|executor| RpcEventLoop {
+		Ok(RpcEventLoop {
 			executor,
 			close: Some(stop),
 			handle: Some(handle),
@@ -148,14 +129,31 @@ impl RpcEventLoop {
 	}
 
 	/// Blocks current thread and waits until the event loop is finished.
-	pub fn wait(mut self) -> thread::Result<()> {
-		self.handle.take().expect("Handle is always set before self is consumed.").join()
+	pub fn wait(mut self) -> Result<(), ()> {
+		self.handle.take().ok_or(())?.wait()
 	}
 
 	/// Finishes this event loop.
 	pub fn close(mut self) {
-		let _ = self.close.take().expect("Close is always set before self is consumed.").send(()).map_err(|e| {
-			warn!("Event Loop is already finished. {:?}", e);
-		});
+		let _ = self
+			.close
+			.take()
+			.expect("Close is always set before self is consumed.")
+			.send(())
+			.map_err(|e| {
+				warn!("Event Loop is already finished. {:?}", e);
+			});
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn make_sure_rpc_event_loop_is_send_and_sync() {
+		fn is_send_and_sync<T: Send + Sync>() {}
+
+		is_send_and_sync::<RpcEventLoop>();
 	}
 }

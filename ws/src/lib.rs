@@ -1,14 +1,12 @@
 //! `WebSockets` server.
 
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 use jsonrpc_server_utils as server_utils;
 
-pub use parity_ws as ws;
 pub use jsonrpc_core;
+pub use ws;
 
-#[macro_use]
-extern crate error_chain;
 #[macro_use]
 extern crate log;
 
@@ -22,12 +20,12 @@ mod tests;
 
 use jsonrpc_core as core;
 
-pub use self::error::{Error, ErrorKind, Result};
-pub use self::metadata::{RequestContext, MetaExtractor, NoopExtractor};
-pub use self::session::{RequestMiddleware, MiddlewareAction};
-pub use self::server::{CloseHandle, Server};
+pub use self::error::{Error, Result};
+pub use self::metadata::{MetaExtractor, NoopExtractor, RequestContext};
+pub use self::server::{Broadcaster, CloseHandle, Server};
 pub use self::server_builder::ServerBuilder;
 pub use self::server_utils::cors::Origin;
-pub use self::server_utils::hosts::{Host, DomainsValidation};
-pub use self::server_utils::tokio;
+pub use self::server_utils::hosts::{DomainsValidation, Host};
 pub use self::server_utils::session::{SessionId, SessionStats};
+pub use self::server_utils::tokio;
+pub use self::session::{MiddlewareAction, RequestMiddleware};

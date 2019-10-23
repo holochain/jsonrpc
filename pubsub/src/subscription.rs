@@ -1,23 +1,23 @@
 //! Subscription primitives.
 
-use std::fmt;
-use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 
+use crate::core::futures::sync::mpsc;
+use crate::core::futures::{self, future, Future, Sink as FuturesSink};
 use crate::core::{self, BoxFuture};
-use crate::core::futures::{self, future, Sink as FuturesSink, Future};
-use crate::core::futures::sync::{mpsc, oneshot};
 
 use crate::handler::{SubscribeRpcMethod, UnsubscribeRpcMethod};
-use crate::types::{PubSubMetadata, SubscriptionId, TransportSender, TransportError, SinkResult};
+use crate::types::{PubSubMetadata, SinkResult, SubscriptionId, TransportError, TransportSender};
 
 /// RPC client session
 /// Keeps track of active subscriptions and unsubscribes from them upon dropping.
 pub struct Session {
-	active_subscriptions: Mutex<HashMap<(SubscriptionId, String), Box<Fn(SubscriptionId) + Send + 'static>>>,
+	active_subscriptions: Mutex<HashMap<(SubscriptionId, String), Box<dyn Fn(SubscriptionId) + Send + 'static>>>,
 	transport: TransportSender,
-	on_drop: Mutex<Vec<Box<FnMut() + Send>>>,
+	on_drop: Mutex<Vec<Box<dyn FnMut() + Send>>>,
 }
 
 impl fmt::Debug for Session {
@@ -56,10 +56,14 @@ impl Session {
 	}
 
 	/// Adds new active subscription
-	fn add_subscription<F>(&self, name: &str, id: &SubscriptionId, remove: F) where
+	fn add_subscription<F>(&self, name: &str, id: &SubscriptionId, remove: F)
+	where
 		F: Fn(SubscriptionId) + Send + 'static,
 	{
-		let ret = self.active_subscriptions.lock().insert((id.clone(), name.into()), Box::new(remove));
+		let ret = self
+			.active_subscriptions
+			.lock()
+			.insert((id.clone(), name.into()), Box::new(remove));
 		if let Some(remove) = ret {
 			warn!("SubscriptionId collision. Unsubscribing previous client.");
 			remove(id.clone());
@@ -140,19 +144,21 @@ impl FuturesSink for Sink {
 pub struct Subscriber {
 	notification: String,
 	transport: TransportSender,
-	sender: oneshot::Sender<Result<SubscriptionId, core::Error>>,
+	sender: crate::oneshot::Sender<Result<SubscriptionId, core::Error>>,
 }
 
 impl Subscriber {
 	/// Creates new subscriber.
 	///
 	/// Should only be used for tests.
-	pub fn new_test<T: Into<String>>(method: T) -> (
+	pub fn new_test<T: Into<String>>(
+		method: T,
+	) -> (
 		Self,
-		oneshot::Receiver<Result<SubscriptionId, core::Error>>,
+		crate::oneshot::Receiver<Result<SubscriptionId, core::Error>>,
 		mpsc::Receiver<String>,
 	) {
-		let (sender, id_receiver) = oneshot::channel();
+		let (sender, id_receiver) = crate::oneshot::channel();
 		let (transport, transport_receiver) = mpsc::channel(1);
 
 		let subscriber = Subscriber {
@@ -165,27 +171,61 @@ impl Subscriber {
 	}
 
 	/// Consumes `Subscriber` and assigns unique id to a requestor.
+	///
 	/// Returns `Err` if request has already terminated.
 	pub fn assign_id(self, id: SubscriptionId) -> Result<Sink, ()> {
-		self.sender.send(Ok(id)).map_err(|_| ())?;
+		let Self {
+			notification,
+			transport,
+			sender,
+		} = self;
+		sender
+			.send(Ok(id))
+			.map(|_| Sink {
+				notification,
+				transport,
+			})
+			.map_err(|_| ())
+	}
 
-		Ok(Sink {
-			notification: self.notification,
-			transport: self.transport,
-		})
+	/// Consumes `Subscriber` and assigns unique id to a requestor.
+	///
+	/// The returned `Future` resolves when the subscriber receives subscription id.
+	/// Resolves to `Err` if request has already terminated.
+	pub fn assign_id_async(self, id: SubscriptionId) -> impl Future<Item = Sink, Error = ()> {
+		let Self {
+			notification,
+			transport,
+			sender,
+		} = self;
+		sender
+			.send_and_wait(Ok(id))
+			.map(|_| Sink {
+				notification,
+				transport,
+			})
+			.map_err(|_| ())
 	}
 
 	/// Rejects this subscription request with given error.
+	///
 	/// Returns `Err` if request has already terminated.
 	pub fn reject(self, error: core::Error) -> Result<(), ()> {
-		self.sender.send(Err(error)).map_err(|_| ())?;
-		Ok(())
+		self.sender.send(Err(error)).map_err(|_| ())
+	}
+
+	/// Rejects this subscription request with given error.
+	///
+	/// The returned `Future` resolves when the rejection is sent to the client.
+	/// Resolves to `Err` if request has already terminated.
+	pub fn reject_async(self, error: core::Error) -> impl Future<Item = (), Error = ()> {
+		self.sender.send_and_wait(Err(error)).map(|_| ()).map_err(|_| ())
 	}
 }
 
-
 /// Creates new subscribe and unsubscribe RPC methods
-pub fn new_subscription<M, F, G>(notification: &str, subscribe: F, unsubscribe: G) -> (Subscribe<F, G>, Unsubscribe<G>) where
+pub fn new_subscription<M, F, G>(notification: &str, subscribe: F, unsubscribe: G) -> (Subscribe<F, G>, Unsubscribe<G>)
+where
 	M: PubSubMetadata,
 	F: SubscribeRpcMethod<M>,
 	G: UnsubscribeRpcMethod<M>,
@@ -228,7 +268,8 @@ pub struct Subscribe<F, G> {
 	unsubscribe: Arc<G>,
 }
 
-impl<M, F, G> core::RpcMethod<M> for Subscribe<F, G> where
+impl<M, F, G> core::RpcMethod<M> for Subscribe<F, G>
+where
 	M: PubSubMetadata,
 	F: SubscribeRpcMethod<M>,
 	G: UnsubscribeRpcMethod<M>,
@@ -236,7 +277,7 @@ impl<M, F, G> core::RpcMethod<M> for Subscribe<F, G> where
 	fn call(&self, params: core::Params, meta: M) -> BoxFuture<core::Value> {
 		match meta.session() {
 			Some(session) => {
-				let (tx, rx) = oneshot::channel();
+				let (tx, rx) = crate::oneshot::channel();
 
 				// Register the subscription
 				let subscriber = Subscriber {
@@ -248,21 +289,19 @@ impl<M, F, G> core::RpcMethod<M> for Subscribe<F, G> where
 
 				let unsub = self.unsubscribe.clone();
 				let notification = self.notification.clone();
-				let subscribe_future = rx
-					.map_err(|_| subscription_rejected())
-					.and_then(move |result| {
-						futures::done(match result {
-							Ok(id) => {
-								session.add_subscription(&notification, &id, move |id| {
-									let _ = unsub.call(id, None).wait();
-								});
-								Ok(id.into())
-							},
-							Err(e) => Err(e),
-						})
-					});
+				let subscribe_future = rx.map_err(|_| subscription_rejected()).and_then(move |result| {
+					futures::done(match result {
+						Ok(id) => {
+							session.add_subscription(&notification, &id, move |id| {
+								let _ = unsub.call(id, None).wait();
+							});
+							Ok(id.into())
+						}
+						Err(e) => Err(e),
+					})
+				});
 				Box::new(subscribe_future)
-			},
+			}
 			None => Box::new(future::err(subscriptions_unavailable())),
 		}
 	}
@@ -274,22 +313,21 @@ pub struct Unsubscribe<G> {
 	unsubscribe: Arc<G>,
 }
 
-impl<M, G> core::RpcMethod<M> for Unsubscribe<G> where
+impl<M, G> core::RpcMethod<M> for Unsubscribe<G>
+where
 	M: PubSubMetadata,
 	G: UnsubscribeRpcMethod<M>,
 {
 	fn call(&self, params: core::Params, meta: M) -> BoxFuture<core::Value> {
 		let id = match params {
-			core::Params::Array(ref vec) if vec.len() == 1 => {
-				SubscriptionId::parse_value(&vec[0])
-			},
+			core::Params::Array(ref vec) if vec.len() == 1 => SubscriptionId::parse_value(&vec[0]),
 			_ => None,
 		};
 		match (meta.session(), id) {
 			(Some(session), Some(id)) => {
 				session.remove_subscription(&self.notification, &id);
 				Box::new(self.unsubscribe.call(id, Some(meta)))
-			},
+			}
 			(Some(_), None) => Box::new(future::err(core::Error::invalid_params("Expected subscription id."))),
 			_ => Box::new(future::err(subscriptions_unavailable())),
 		}
@@ -298,15 +336,15 @@ impl<M, G> core::RpcMethod<M> for Unsubscribe<G> where
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
-	use std::sync::atomic::{AtomicBool, Ordering};
 	use crate::core;
-	use crate::core::RpcMethod;
+	use crate::core::futures::sync::mpsc;
 	use crate::core::futures::{Async, Future, Stream};
-	use crate::core::futures::sync::{mpsc, oneshot};
-	use crate::types::{SubscriptionId, PubSubMetadata};
+	use crate::core::RpcMethod;
+	use crate::types::{PubSubMetadata, SubscriptionId};
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::Arc;
 
-	use super::{Session, Sink, Subscriber, new_subscription};
+	use super::{new_subscription, Session, Sink, Subscriber};
 
 	fn session() -> (Session, mpsc::Receiver<String>) {
 		let (tx, rx) = mpsc::channel(1);
@@ -381,7 +419,9 @@ mod tests {
 		};
 
 		// when
-		sink.notify(core::Params::Array(vec![core::Value::Number(10.into())])).wait().unwrap();
+		sink.notify(core::Params::Array(vec![core::Value::Number(10.into())]))
+			.wait()
+			.unwrap();
 
 		// then
 		assert_eq!(
@@ -394,21 +434,19 @@ mod tests {
 	fn should_assign_id() {
 		// given
 		let (transport, _) = mpsc::channel(1);
-		let (tx, mut rx) = oneshot::channel();
+		let (tx, mut rx) = crate::oneshot::channel();
 		let subscriber = Subscriber {
 			notification: "test".into(),
-			transport: transport,
+			transport,
 			sender: tx,
 		};
 
 		// when
-		let sink = subscriber.assign_id(SubscriptionId::Number(5)).unwrap();
+		let sink = subscriber.assign_id_async(SubscriptionId::Number(5));
 
 		// then
-		assert_eq!(
-			rx.poll().unwrap(),
-			Async::Ready(Ok(SubscriptionId::Number(5)))
-		);
+		assert_eq!(rx.poll().unwrap(), Async::Ready(Ok(SubscriptionId::Number(5))));
+		let sink = sink.wait().unwrap();
 		assert_eq!(sink.notification, "test".to_owned());
 	}
 
@@ -416,10 +454,10 @@ mod tests {
 	fn should_reject() {
 		// given
 		let (transport, _) = mpsc::channel(1);
-		let (tx, mut rx) = oneshot::channel();
+		let (tx, mut rx) = crate::oneshot::channel();
 		let subscriber = Subscriber {
 			notification: "test".into(),
-			transport: transport,
+			transport,
 			sender: tx,
 		};
 		let error = core::Error {
@@ -429,13 +467,11 @@ mod tests {
 		};
 
 		// when
-		subscriber.reject(error.clone()).unwrap();
+		let reject = subscriber.reject_async(error.clone());
 
 		// then
-		assert_eq!(
-			rx.poll().unwrap(),
-			Async::Ready(Err(error))
-		);
+		assert_eq!(rx.poll().unwrap(), Async::Ready(Err(error)));
+		reject.wait().unwrap();
 	}
 
 	#[derive(Clone, Default)]
@@ -467,10 +503,13 @@ mod tests {
 
 		// then
 		assert_eq!(called.load(Ordering::SeqCst), true);
-		assert_eq!(result.wait(), Err(core::Error {
-			code: core::ErrorCode::ServerError(-32091),
-			message: "Subscription rejected".into(),
-			data: None,
-		}));
+		assert_eq!(
+			result.wait(),
+			Err(core::Error {
+				code: core::ErrorCode::ServerError(-32091),
+				message: "Subscription rejected".into(),
+				data: None,
+			})
+		);
 	}
 }
